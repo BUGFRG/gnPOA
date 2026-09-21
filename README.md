@@ -48,6 +48,7 @@ make gpu=1 NVCC_ARCH=-arch=sm_86
 
 # 3. Verify CUDA runtime linkage
 ldd bin/abpoa | grep cudart
+
 ## 🚀 Usage
 ### 1. Produce Help Page
 ```bash
@@ -73,3 +74,5 @@ ABPOA_GPU_BAND=8 \
 ABPOA_GPU_BATCH=256 \
 ABPOA_GPU_THREADS=128 \
 ./bin/abpoa -U -i graph.gfa -r 4 -b -1 -o output_gpu.txt reads.fq
+```
+---
