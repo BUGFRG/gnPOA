@@ -12,7 +12,7 @@
 **gnPOA** is a high-throughput, GPU-accelerated partial order alignment engine designed for **sequence-to-graph mapping**. By redesigning the graph representation into memory-efficient flattened arrays on the GPU and implementing **on-device dynamic programming (DP) and traceback**, gnPOA delivers high-speed alignment while rigorously preserving alignment score accuracy under complex convex double-affine gap models.
 
 <p align="center">
-  <img src="docs/gnpoa_architecture.png" alt="gnPOA Architecture" width="700"/>
+  <img src="https://github.com/user-attachments/assets/0509c1a4-c52e-4c06-a9fe-6277e723bd95" alt="gnPOA Architecture" width="800"/>
   <br>
   <em>Figure: Overview of gnPOA GPU-accelerated sequence-to-graph alignment workflow.</em>
 </p>
