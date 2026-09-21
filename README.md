@@ -14,7 +14,7 @@
 <p align="center">
   <img src="https://github.com/user-attachments/assets/0509c1a4-c52e-4c06-a9fe-6277e723bd95" alt="gnPOA Architecture" width="800"/>
   <br>
-  <em>Figure: Overview of gnPOA GPU-accelerated sequence-to-graph alignment workflow.</em>
+  <em>Figure: DP of gnPOA GPU-accelerated sequence-to-graph alignment.</em>
 </p>
 
 ---
