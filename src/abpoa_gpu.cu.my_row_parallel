@@ -1,0 +1,1285 @@
+#include <cuda_runtime.h>
+
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "abpoa_align.h"
+#include "abpoa_gpu.h"
+#include "abpoa_graph.h"
+#include "utils.h"
+
+#define GPU_INF_NEG (-1000000000)
+#define ABPOA_GPU_MAX_ERRMSG 256
+
+static char abpoa_gpu_errmsg[ABPOA_GPU_MAX_ERRMSG] = "ok";
+
+static void gpu_set_error(const char *msg) {
+    snprintf(abpoa_gpu_errmsg, sizeof(abpoa_gpu_errmsg), "%s", msg);
+}
+
+static void gpu_set_cuda_error(const char *what, cudaError_t err) {
+    snprintf(abpoa_gpu_errmsg, sizeof(abpoa_gpu_errmsg), "%s: %s", what, cudaGetErrorString(err));
+}
+
+extern "C" const char *abpoa_gpu_last_error(void) {
+    return abpoa_gpu_errmsg;
+}
+
+enum {
+    GPU_STATE_M = 0,
+    GPU_STATE_E1 = 1,
+    GPU_STATE_E2 = 2,
+    GPU_STATE_F1 = 3,
+    GPU_STATE_F2 = 4
+};
+
+__host__ __device__ static inline size_t gpu_cell(int idx, int j, int qcols) {
+    return (size_t)idx * (size_t)qcols + (size_t)j;
+}
+
+__host__ __device__ static inline int gpu_max2(int a, int b) {
+    return a > b ? a : b;
+}
+
+#define ABPOA_GPU_MAX_MAT 256
+__constant__ int d_mat_const[ABPOA_GPU_MAX_MAT];
+
+__device__ static inline int gpu_score_pair(int *mat, int m, uint8_t a, uint8_t b) {
+    (void)mat; // Ignore global memory matrix, use constant memory
+    return d_mat_const[(int)a * m + (int)b];
+}
+
+__device__ static inline int gpu_cell_in_band(int idx, int j, int qlen, int n_nodes,
+                                             int source_index, int sink_index, int band) {
+    if (band <= 0 || idx == source_index || idx == sink_index) return 1;
+    int denom = n_nodes > 2 ? n_nodes - 2 : n_nodes;
+    int center = (int)(((long long)idx * (long long)qlen + denom / 2) / denom);
+    int delta = j - center;
+    return delta >= -band && delta <= band;
+}
+
+__device__ static inline int gpu_score_valid(int v) {
+    return v > GPU_INF_NEG / 2;
+}
+
+__device__ static inline int gpu_gap_out_score(int h, int e, int gap_oe, int gap_ext) {
+    int best = GPU_INF_NEG;
+    if (gpu_score_valid(e)) best = e - gap_ext;
+    if (gpu_score_valid(h)) {
+        int cand = h - gap_oe;
+        if (cand > best) best = cand;
+    }
+    return best;
+}
+
+__device__ static inline abpoa_cigar_t gpu_make_cigar(int op, int len, int32_t node_id, int32_t query_id) {
+    uint64_t l = (uint64_t)len;
+    uint64_t n_id = (uint64_t)(uint32_t)node_id;
+    uint64_t q_id = (uint64_t)(uint32_t)query_id;
+    if (op == ABPOA_CMATCH || op == ABPOA_CDIFF) return n_id << 34 | q_id << 4 | (uint64_t)op;
+    if (op == ABPOA_CINS || op == ABPOA_CSOFT_CLIP || op == ABPOA_CHARD_CLIP) return q_id << 34 | l << 4 | (uint64_t)op;
+    return n_id << 34 | l << 4 | (uint64_t)op;
+}
+
+__global__ void abpoa_gpu_dp_kernel(
+        int n_nodes, int qlen, int qcols, int source_index, int sink_index,
+        const uint8_t *query, const uint8_t *bases, const int *mat, int m,
+        const int *pred_offsets, const int *preds,
+        int gap_open1, int gap_open2, int gap_ext1, int gap_ext2,
+        int *dp_m, int *dp_e1, int *dp_e2, int *dp_f1, int *dp_f2, int *dp_h,
+        int *best_score, int *best_index) {
+    if (blockIdx.x != 0) return;
+    int tid = threadIdx.x, stride = blockDim.x;
+
+    size_t total = (size_t)n_nodes * (size_t)qcols;
+    for (size_t i = (size_t)tid; i < total; i += (size_t)stride) {
+        dp_m[i] = dp_e1[i] = dp_e2[i] = dp_f1[i] = dp_f2[i] = dp_h[i] = GPU_INF_NEG;
+    }
+    __syncthreads();
+
+    int gap_oe1 = gap_open1 + gap_ext1;
+    int gap_oe2 = gap_open2 + gap_ext2;
+    if (tid == 0) {
+        size_t c0 = gpu_cell(source_index, 0, qcols);
+        dp_m[c0] = 0;
+        dp_h[c0] = 0;
+        dp_e1[c0] = -gap_oe1;
+        dp_e2[c0] = gap_open2 > 0 ? -gap_oe2 : GPU_INF_NEG;
+    }
+    for (int j = tid + 1; j <= qlen; j += stride) {
+        size_t c = gpu_cell(source_index, j, qcols);
+        int s1 = -(gap_open1 + gap_ext1 * j);
+        int s2 = gap_open2 > 0 ? -(gap_open2 + gap_ext2 * j) : GPU_INF_NEG;
+        dp_h[c] = gpu_max2(s1, s2);
+        dp_f1[c] = s1;
+        dp_f2[c] = s2;
+    }
+    __syncthreads();
+
+    extern __shared__ int smem[];
+    int *sh_h_pre = smem;
+    int *sh_f1    = smem + blockDim.x;
+    int *sh_f2    = smem + 2 * blockDim.x;
+
+    for (int idx = 0; idx < n_nodes; ++idx) {
+        if (idx == source_index || idx == sink_index) continue;
+        int p_beg = pred_offsets[idx], p_end = pred_offsets[idx + 1];
+        
+        int carry_f1 = GPU_INF_NEG;
+        int carry_f2 = GPU_INF_NEG;
+        
+        if (tid == 0) {
+            int best_e1_0 = GPU_INF_NEG, best_e2_0 = GPU_INF_NEG;
+            for (int k = p_beg; k < p_end; ++k) {
+                int pred = preds[k];
+                if (1) {
+                    size_t pc = gpu_cell(pred, 0, qcols);
+                    int h_pc = dp_h[pc];
+                    int e1_pc = dp_e1[pc];
+                    if (h_pc > GPU_INF_NEG / 2) {
+                        int cand = h_pc - gap_oe1;
+                        if (cand > best_e1_0) best_e1_0 = cand;
+                    }
+                    if (e1_pc > GPU_INF_NEG / 2) {
+                        int cand = e1_pc - gap_ext1;
+                        if (cand > best_e1_0) best_e1_0 = cand;
+                    }
+                    if (gap_open2 > 0) {
+                        int e2_pc = dp_e2[pc];
+                        if (h_pc > GPU_INF_NEG / 2) {
+                            int cand = h_pc - gap_oe2;
+                            if (cand > best_e2_0) best_e2_0 = cand;
+                        }
+                        if (e2_pc > GPU_INF_NEG / 2) {
+                            int cand = e2_pc - gap_ext2;
+                            if (cand > best_e2_0) best_e2_0 = cand;
+                        }
+                    }
+                }
+            }
+            int best_h_0 = best_e1_0;
+            if (best_e2_0 > best_h_0) best_h_0 = best_e2_0;
+            
+            size_t cur0 = gpu_cell(idx, 0, qcols);
+            dp_e1[cur0] = best_e1_0;
+            dp_e2[cur0] = best_e2_0;
+            dp_h[cur0] = best_h_0;
+            // f1 and f2 are already -INF from init
+            
+            if (best_h_0 > GPU_INF_NEG / 2) {
+                carry_f1 = best_h_0 - gap_oe1;
+                if (gap_open2 > 0) carry_f2 = best_h_0 - gap_oe2;
+            }
+        }
+        __syncthreads();
+
+        for (int j_base = 1; j_base <= qlen; j_base += stride) {
+            int j = j_base + tid;
+            bool valid_j = j <= qlen;
+            
+            int best_m = GPU_INF_NEG, best_e1 = GPU_INF_NEG, best_e2 = GPU_INF_NEG;
+            
+            if (valid_j) {
+                
+                int s = gpu_score_pair((int*)mat, m, bases[idx], query[j - 1]);
+                for (int k = p_beg; k < p_end; ++k) {
+                    int pred = preds[k];
+                    
+                        size_t pc = gpu_cell(pred, j, qcols);
+                        int h_pc = dp_h[pc];
+                        int e1_pc = dp_e1[pc];
+                        if (h_pc > GPU_INF_NEG / 2) {
+                            int cand = h_pc - gap_oe1;
+                            if (cand > best_e1) best_e1 = cand;
+                        }
+                        if (e1_pc > GPU_INF_NEG / 2) {
+                            int cand = e1_pc - gap_ext1;
+                            if (cand > best_e1) best_e1 = cand;
+                        }
+                        if (gap_open2 > 0) {
+                            int e2_pc = dp_e2[pc];
+                            if (h_pc > GPU_INF_NEG / 2) {
+                                int cand = h_pc - gap_oe2;
+                                if (cand > best_e2) best_e2 = cand;
+                            }
+                            if (e2_pc > GPU_INF_NEG / 2) {
+                                int cand = e2_pc - gap_ext2;
+                                if (cand > best_e2) best_e2 = cand;
+                            }
+                        }
+                    
+                    
+                    
+                        int h_pc_prev = dp_h[gpu_cell(pred, j - 1, qcols)];
+                        if (h_pc_prev > GPU_INF_NEG / 2) {
+                            int cand = h_pc_prev + s;
+                            if (cand > best_m) best_m = cand;
+                        }
+                    
+                }
+            }
+            
+            int h_pre = best_m;
+            if (best_e1 > h_pre) h_pre = best_e1;
+            if (best_e2 > h_pre) h_pre = best_e2;
+            
+            sh_h_pre[tid] = h_pre;
+            __syncthreads();
+            
+            if (tid == 0) {
+                int f1 = carry_f1;
+                int f2 = carry_f2;
+                for (int i = 0; i < stride; ++i) {
+                    if (j_base + i > qlen) break;
+                    int h = sh_h_pre[i];
+                    if (f1 > h) h = f1;
+                    if (f2 > h) h = f2;
+                    sh_h_pre[i] = h;
+                    sh_f1[i] = f1;
+                    sh_f2[i] = f2;
+                    
+                    int next_f1 = h - gap_oe1;
+                    int f1_ext = f1 - gap_ext1;
+                    if (f1_ext > next_f1) next_f1 = f1_ext;
+                    f1 = next_f1;
+                    
+                    if (gap_open2 > 0) {
+                        int next_f2 = h - gap_oe2;
+                        int f2_ext = f2 - gap_ext2;
+                        if (f2_ext > next_f2) next_f2 = f2_ext;
+                        f2 = next_f2;
+                    }
+                }
+                carry_f1 = f1;
+                carry_f2 = f2;
+            }
+            __syncthreads();
+            
+            if (valid_j) {
+                size_t cur = gpu_cell(idx, j, qcols);
+                dp_m[cur] = best_m;
+                dp_e1[cur] = best_e1;
+                dp_e2[cur] = best_e2;
+                dp_f1[cur] = sh_f1[tid];
+                dp_f2[cur] = sh_f2[tid];
+                dp_h[cur] = sh_h_pre[tid];
+            }
+        }
+    }
+
+    if (tid == 0) {
+        int best = GPU_INF_NEG, best_idx = source_index;
+        int s_beg = pred_offsets[sink_index], s_end = pred_offsets[sink_index + 1];
+        for (int k = s_beg; k < s_end; ++k) {
+            int pred = preds[k];
+            int h = dp_h[gpu_cell(pred, qlen, qcols)];
+            if (h > best) {
+                best = h;
+                best_idx = pred;
+            }
+        }
+        *best_score = best;
+        *best_index = best_idx;
+    }
+}
+
+__global__ void abpoa_gpu_dp_batch_kernel(
+        int batch_n, int n_nodes, int max_qlen, int qcols, int source_index, int sink_index,
+        const uint8_t *queries, const int *qlens, const uint8_t *bases, const int *mat, int m,
+        const int *pred_offsets, const int *preds,
+        int gap_open1, int gap_open2, int gap_ext1, int gap_ext2,
+        int band,
+        int *dp_m_all, int *dp_e1_all, int *dp_e2_all, int *dp_f1_all, int *dp_f2_all, int *dp_h_all,
+        int *best_scores, int *best_indices) {
+    int b = blockIdx.x;
+    if (b >= batch_n) return;
+
+    int qlen = qlens[b];
+    size_t cells = (size_t)n_nodes * (size_t)qcols;
+    const uint8_t *query = queries + (size_t)b * (size_t)max_qlen;
+    int *dp_m = dp_m_all + (size_t)b * cells;
+    int *dp_e1 = dp_e1_all + (size_t)b * cells;
+    int *dp_e2 = dp_e2_all + (size_t)b * cells;
+    int *dp_f1 = dp_f1_all + (size_t)b * cells;
+    int *dp_f2 = dp_f2_all + (size_t)b * cells;
+    int *dp_h = dp_h_all + (size_t)b * cells;
+    int tid = threadIdx.x, stride = blockDim.x;
+
+    size_t total = (size_t)n_nodes * (size_t)qcols;
+    for (size_t i = (size_t)tid; i < total; i += (size_t)stride) {
+        dp_m[i] = dp_e1[i] = dp_e2[i] = dp_f1[i] = dp_f2[i] = dp_h[i] = GPU_INF_NEG;
+    }
+    __syncthreads();
+
+    int gap_oe1 = gap_open1 + gap_ext1;
+    int gap_oe2 = gap_open2 + gap_ext2;
+    if (tid == 0) {
+        size_t c0 = gpu_cell(source_index, 0, qcols);
+        dp_m[c0] = 0;
+        dp_h[c0] = 0;
+        dp_e1[c0] = -gap_oe1;
+        dp_e2[c0] = gap_open2 > 0 ? -gap_oe2 : GPU_INF_NEG;
+    }
+    for (int j = tid + 1; j <= qlen; j += stride) {
+        size_t c = gpu_cell(source_index, j, qcols);
+        int s1 = -(gap_open1 + gap_ext1 * j);
+        int s2 = gap_open2 > 0 ? -(gap_open2 + gap_ext2 * j) : GPU_INF_NEG;
+        dp_h[c] = gpu_max2(s1, s2);
+        dp_f1[c] = s1;
+        dp_f2[c] = s2;
+    }
+    __syncthreads();
+
+    extern __shared__ int smem[];
+    int *sh_h_pre = smem;
+    int *sh_f1    = smem + blockDim.x;
+    int *sh_f2    = smem + 2 * blockDim.x;
+
+    for (int idx = 0; idx < n_nodes; ++idx) {
+        if (idx == source_index || idx == sink_index) continue;
+        int p_beg = pred_offsets[idx], p_end = pred_offsets[idx + 1];
+        
+        int carry_f1 = GPU_INF_NEG;
+        int carry_f2 = GPU_INF_NEG;
+        
+        if (tid == 0) {
+            int best_e1_0 = GPU_INF_NEG, best_e2_0 = GPU_INF_NEG;
+            for (int k = p_beg; k < p_end; ++k) {
+                int pred = preds[k];
+                if (gpu_cell_in_band(pred, 0, qlen, n_nodes, source_index, sink_index, band)) {
+                    size_t pc = gpu_cell(pred, 0, qcols);
+                    int h_pc = dp_h[pc];
+                    int e1_pc = dp_e1[pc];
+                    if (h_pc > GPU_INF_NEG / 2) {
+                        int cand = h_pc - gap_oe1;
+                        if (cand > best_e1_0) best_e1_0 = cand;
+                    }
+                    if (e1_pc > GPU_INF_NEG / 2) {
+                        int cand = e1_pc - gap_ext1;
+                        if (cand > best_e1_0) best_e1_0 = cand;
+                    }
+                    if (gap_open2 > 0) {
+                        int e2_pc = dp_e2[pc];
+                        if (h_pc > GPU_INF_NEG / 2) {
+                            int cand = h_pc - gap_oe2;
+                            if (cand > best_e2_0) best_e2_0 = cand;
+                        }
+                        if (e2_pc > GPU_INF_NEG / 2) {
+                            int cand = e2_pc - gap_ext2;
+                            if (cand > best_e2_0) best_e2_0 = cand;
+                        }
+                    }
+                }
+            }
+            int best_h_0 = best_e1_0;
+            if (best_e2_0 > best_h_0) best_h_0 = best_e2_0;
+            
+            size_t cur0 = gpu_cell(idx, 0, qcols);
+            dp_e1[cur0] = best_e1_0;
+            dp_e2[cur0] = best_e2_0;
+            dp_h[cur0] = best_h_0;
+            // f1 and f2 are already -INF from init
+            
+            if (best_h_0 > GPU_INF_NEG / 2) {
+                carry_f1 = best_h_0 - gap_oe1;
+                if (gap_open2 > 0) carry_f2 = best_h_0 - gap_oe2;
+            }
+        }
+        __syncthreads();
+
+        for (int j_base = 1; j_base <= qlen; j_base += stride) {
+            int j = j_base + tid;
+            bool valid_j = j <= qlen;
+            
+            int best_m = GPU_INF_NEG, best_e1 = GPU_INF_NEG, best_e2 = GPU_INF_NEG;
+            
+            if (valid_j) {
+                if (!gpu_cell_in_band(idx, j, qlen, n_nodes, source_index, sink_index, band)) {
+                    // skip calculating if out of band
+                } else {
+                    int s = gpu_score_pair((int*)mat, m, bases[idx], query[j - 1]);
+                    for (int k = p_beg; k < p_end; ++k) {
+                        int pred = preds[k];
+                        if (gpu_cell_in_band(pred, j, qlen, n_nodes, source_index, sink_index, band)) {
+                            size_t pc = gpu_cell(pred, j, qcols);
+                            int h_pc = dp_h[pc];
+                            int e1_pc = dp_e1[pc];
+                            if (h_pc > GPU_INF_NEG / 2) {
+                                int cand = h_pc - gap_oe1;
+                                if (cand > best_e1) best_e1 = cand;
+                            }
+                            if (e1_pc > GPU_INF_NEG / 2) {
+                                int cand = e1_pc - gap_ext1;
+                                if (cand > best_e1) best_e1 = cand;
+                            }
+                            if (gap_open2 > 0) {
+                                int e2_pc = dp_e2[pc];
+                                if (h_pc > GPU_INF_NEG / 2) {
+                                    int cand = h_pc - gap_oe2;
+                                    if (cand > best_e2) best_e2 = cand;
+                                }
+                                if (e2_pc > GPU_INF_NEG / 2) {
+                                    int cand = e2_pc - gap_ext2;
+                                    if (cand > best_e2) best_e2 = cand;
+                                }
+                            }
+                        }
+                        if (gpu_cell_in_band(pred, j - 1, qlen, n_nodes, source_index, sink_index, band)) {
+                            int h_pc_prev = dp_h[gpu_cell(pred, j - 1, qcols)];
+                            if (h_pc_prev > GPU_INF_NEG / 2) {
+                                int cand = h_pc_prev + s;
+                                if (cand > best_m) best_m = cand;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            int h_pre = best_m;
+            if (best_e1 > h_pre) h_pre = best_e1;
+            if (best_e2 > h_pre) h_pre = best_e2;
+            
+            sh_h_pre[tid] = h_pre;
+            __syncthreads();
+            
+            if (tid == 0) {
+                int f1 = carry_f1;
+                int f2 = carry_f2;
+                                for (int i = 0; i < stride; ++i) {
+                    if (j_base + i > qlen) break;
+                    bool in_band = gpu_cell_in_band(idx, j_base + i, qlen, n_nodes, source_index, sink_index, band);
+                    if (!in_band) {
+                        f1 = GPU_INF_NEG;
+                        f2 = GPU_INF_NEG;
+                        sh_h_pre[i] = GPU_INF_NEG;
+                        sh_f1[i] = GPU_INF_NEG;
+                        sh_f2[i] = GPU_INF_NEG;
+                        continue;
+                    }
+                    
+                    int h = sh_h_pre[i];
+                    if (f1 > h) h = f1;
+                    if (f2 > h) h = f2;
+                    sh_h_pre[i] = h;
+                    sh_f1[i] = f1;
+                    sh_f2[i] = f2;
+                    
+                    int next_f1 = h - gap_oe1;
+                    int f1_ext = f1 - gap_ext1;
+                    if (f1_ext > next_f1) next_f1 = f1_ext;
+                    f1 = next_f1;
+                    
+                    if (gap_open2 > 0) {
+                        int next_f2 = h - gap_oe2;
+                        int f2_ext = f2 - gap_ext2;
+                        if (f2_ext > next_f2) next_f2 = f2_ext;
+                        f2 = next_f2;
+                    }
+                }
+                carry_f1 = f1;
+                carry_f2 = f2;
+            }
+            __syncthreads();
+            
+            if (valid_j) {
+                size_t cur = gpu_cell(idx, j, qcols);
+                dp_m[cur] = best_m;
+                dp_e1[cur] = best_e1;
+                dp_e2[cur] = best_e2;
+                dp_f1[cur] = sh_f1[tid];
+                dp_f2[cur] = sh_f2[tid];
+                dp_h[cur] = sh_h_pre[tid];
+            }
+        }
+    }
+
+    if (tid == 0) {
+        int best = GPU_INF_NEG, best_idx = source_index;
+        int s_beg = pred_offsets[sink_index], s_end = pred_offsets[sink_index + 1];
+        for (int k = s_beg; k < s_end; ++k) {
+            int pred = preds[k];
+            if (!gpu_cell_in_band(pred, qlen, qlen, n_nodes, source_index, sink_index, band)) continue;
+            int h = dp_h[gpu_cell(pred, qlen, qcols)];
+            if (h > best) {
+                best = h;
+                best_idx = pred;
+            }
+        }
+        best_scores[b] = best;
+        best_indices[b] = best_idx;
+    }
+}
+
+__device__ static inline int gpu_gap_out_i32(const int *dp_h, const int *dp_e,
+                                             int idx, int j, int qcols,
+                                             int gap_oe, int gap_ext) {
+    size_t c = gpu_cell(idx, j, qcols);
+    return gpu_gap_out_score(dp_h[c], dp_e[c], gap_oe, gap_ext);
+}
+
+__device__ static inline int gpu_trace_match_i32(
+        int *idx, int *j, int qcols, const uint8_t *query, const uint8_t *bases,
+        const int *mat, int m, const int *node_ids, const int *pred_offsets, const int *preds,
+        const int *dp_h, abpoa_cigar_t *out_cigar, int *n_c) {
+    if (*j <= 0) return 0;
+    int h = dp_h[gpu_cell(*idx, *j, qcols)];
+    int s = gpu_score_pair((int*)mat, m, bases[*idx], query[*j - 1]);
+    int p_beg = pred_offsets[*idx], p_end = pred_offsets[*idx + 1];
+    for (int k = p_beg; k < p_end; ++k) {
+        int pred = preds[k];
+        int pred_h = dp_h[gpu_cell(pred, *j - 1, qcols)];
+        if (gpu_score_valid(pred_h) && pred_h + s == h) {
+            out_cigar[(*n_c)++] = gpu_make_cigar(ABPOA_CMATCH, 1, node_ids[*idx], *j - 1);
+            *idx = pred;
+            --(*j);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+__device__ static int gpu_traceback_cpu_style_i32(
+        int qlen, int qcols, int source_index, int best_index,
+        const uint8_t *query, const uint8_t *bases, const int *mat, int m,
+        const int *node_ids, const int *pred_offsets, const int *preds,
+        int gap_open1, int gap_open2, int gap_ext1, int gap_ext2,
+        int put_gap_on_right, int put_gap_at_end,
+        const int *dp_e1, const int *dp_e2, const int *dp_f1, const int *dp_f2, const int *dp_h,
+        abpoa_cigar_t *out_cigar, int max_cigar) {
+    int idx = best_index, j = qlen;
+    int n_c = 0;
+    int cur_op = ABPOA_ALL_OP;
+    int look_for_first_gap_at_end = put_gap_at_end;
+    int gap_oe1 = gap_open1 + gap_ext1;
+    int gap_oe2 = gap_open2 + gap_ext2;
+
+    while (idx != source_index && j > 0) {
+        if (n_c >= max_cigar) return -1;
+        int hit = 0;
+        int h = dp_h[gpu_cell(idx, j, qcols)];
+
+        if (put_gap_on_right == 0 && look_for_first_gap_at_end == 0 && (cur_op & ABPOA_M_OP)) {
+            hit = gpu_trace_match_i32(&idx, &j, qcols, query, bases, mat, m, node_ids,
+                                      pred_offsets, preds, dp_h, out_cigar, &n_c);
+            if (hit) cur_op = ABPOA_ALL_OP;
+        }
+
+        if (!hit && (cur_op & ABPOA_E_OP)) {
+            int p_beg = pred_offsets[idx], p_end = pred_offsets[idx + 1];
+            int cur_e1 = gpu_gap_out_i32(dp_h, dp_e1, idx, j, qcols, gap_oe1, gap_ext1);
+            int cur_e2 = gap_open2 > 0 ? gpu_gap_out_i32(dp_h, dp_e2, idx, j, qcols, gap_oe2, gap_ext2) : GPU_INF_NEG;
+            for (int k = p_beg; k < p_end && !hit; ++k) {
+                int pred = preds[k];
+                int pred_h = dp_h[gpu_cell(pred, j, qcols)];
+                if (cur_op & ABPOA_E1_OP) {
+                    int pred_out = gpu_gap_out_i32(dp_h, dp_e1, pred, j, qcols, gap_oe1, gap_ext1);
+                    int ok = (cur_op & ABPOA_M_OP) ? (h == pred_out) :
+                             (gpu_score_valid(cur_e1) && gpu_score_valid(pred_out) && pred_out - gap_ext1 == cur_e1);
+                    if (ok) {
+                        cur_op = (gpu_score_valid(pred_h) && pred_h - gap_oe1 == pred_out) ? (ABPOA_M_OP | ABPOA_F_OP) : ABPOA_E1_OP;
+                        out_cigar[n_c++] = gpu_make_cigar(ABPOA_CDEL, 1, node_ids[idx], j - 1);
+                        idx = pred;
+                        hit = 1;
+                    }
+                }
+                if (!hit && (cur_op & ABPOA_E2_OP)) {
+                    int pred_out = gpu_gap_out_i32(dp_h, dp_e2, pred, j, qcols, gap_oe2, gap_ext2);
+                    int ok = (cur_op & ABPOA_M_OP) ? (h == pred_out) :
+                             (gpu_score_valid(cur_e2) && gpu_score_valid(pred_out) && pred_out - gap_ext2 == cur_e2);
+                    if (ok) {
+                        cur_op = (gpu_score_valid(pred_h) && pred_h - gap_oe2 == pred_out) ? (ABPOA_M_OP | ABPOA_F_OP) : ABPOA_E2_OP;
+                        out_cigar[n_c++] = gpu_make_cigar(ABPOA_CDEL, 1, node_ids[idx], j - 1);
+                        idx = pred;
+                        hit = 1;
+                    }
+                }
+            }
+            if (hit && look_for_first_gap_at_end) look_for_first_gap_at_end = 0;
+        }
+
+        if (!hit && (cur_op & ABPOA_F_OP)) {
+            size_t cur = gpu_cell(idx, j, qcols);
+            size_t left = gpu_cell(idx, j - 1, qcols);
+            if (cur_op & ABPOA_F1_OP) {
+                int f = dp_f1[cur];
+                if ((cur_op & ABPOA_M_OP) == 0 || h == f) {
+                    if (gpu_score_valid(dp_h[left]) && dp_h[left] - gap_oe1 == f) {
+                        cur_op = ABPOA_M_OP | ABPOA_E_OP;
+                        hit = 1;
+                    } else if (gpu_score_valid(dp_f1[left]) && dp_f1[left] - gap_ext1 == f) {
+                        cur_op = ABPOA_F1_OP;
+                        hit = 1;
+                    }
+                }
+            }
+            if (!hit && (cur_op & ABPOA_F2_OP)) {
+                int f = dp_f2[cur];
+                if ((cur_op & ABPOA_M_OP) == 0 || h == f) {
+                    if (gpu_score_valid(dp_h[left]) && dp_h[left] - gap_oe2 == f) {
+                        cur_op = ABPOA_M_OP | ABPOA_E_OP;
+                        hit = 1;
+                    } else if (gpu_score_valid(dp_f2[left]) && dp_f2[left] - gap_ext2 == f) {
+                        cur_op = ABPOA_F2_OP;
+                        hit = 1;
+                    }
+                }
+            }
+            if (hit) {
+                out_cigar[n_c++] = gpu_make_cigar(ABPOA_CINS, 1, node_ids[idx], j - 1);
+                --j;
+                if (look_for_first_gap_at_end) look_for_first_gap_at_end = 0;
+            }
+        }
+
+        if (!hit && (cur_op & ABPOA_M_OP)) {
+            hit = gpu_trace_match_i32(&idx, &j, qcols, query, bases, mat, m, node_ids,
+                                      pred_offsets, preds, dp_h, out_cigar, &n_c);
+            if (hit) {
+                cur_op = ABPOA_ALL_OP;
+                look_for_first_gap_at_end = 0;
+            }
+        }
+
+        if (!hit) return -1;
+    }
+
+    while (j > 0) {
+        if (n_c >= max_cigar) return -1;
+        out_cigar[n_c++] = gpu_make_cigar(ABPOA_CINS, 1, -1, j - 1);
+        --j;
+    }
+    return n_c;
+}
+
+__global__ void abpoa_gpu_traceback_kernel(
+        int qlen, int qcols, int source_index, int best_index,
+        const uint8_t *query, const uint8_t *bases, const int *mat, int m,
+        const int *node_ids, const int *pred_offsets, const int *preds,
+        int gap_open1, int gap_open2, int gap_ext1, int gap_ext2,
+        int put_gap_on_right, int put_gap_at_end,
+        const int *dp_e1, const int *dp_e2, const int *dp_f1, const int *dp_f2, const int *dp_h,
+        abpoa_cigar_t *out_cigar, int max_cigar, int *out_n_cigar, int *out_status) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    int n_c = gpu_traceback_cpu_style_i32(
+            qlen, qcols, source_index, best_index, query, bases, mat, m, node_ids,
+            pred_offsets, preds, gap_open1, gap_open2, gap_ext1, gap_ext2,
+            put_gap_on_right, put_gap_at_end, dp_e1, dp_e2, dp_f1, dp_f2, dp_h,
+            out_cigar, max_cigar);
+    *out_n_cigar = n_c > 0 ? n_c : 0;
+    *out_status = n_c > 0 ? 0 : -1;
+}
+
+__global__ void abpoa_gpu_traceback_batch_kernel(
+        int batch_n, int n_nodes, int max_qlen, int qcols, int source_index, const int *best_indices,
+        const int *qlens, const uint8_t *queries, const uint8_t *bases, const int *mat, int m,
+        const int *node_ids, const int *pred_offsets, const int *preds,
+        int gap_open1, int gap_open2, int gap_ext1, int gap_ext2,
+        int put_gap_on_right, int put_gap_at_end,
+        const int *dp_e1_all, const int *dp_e2_all, const int *dp_f1_all, const int *dp_f2_all, const int *dp_h_all,
+        abpoa_cigar_t *out_cigar_all, int max_cigar, int *out_n_cigar, int *out_status) {
+    int b = blockIdx.x;
+    if (b >= batch_n || threadIdx.x != 0) return;
+
+    int qlen = qlens[b];
+    size_t cells = (size_t)n_nodes * (size_t)qcols;
+    const uint8_t *query = queries + (size_t)b * (size_t)max_qlen;
+    const int *dp_e1 = dp_e1_all + (size_t)b * cells;
+    const int *dp_e2 = dp_e2_all + (size_t)b * cells;
+    const int *dp_f1 = dp_f1_all + (size_t)b * cells;
+    const int *dp_f2 = dp_f2_all + (size_t)b * cells;
+    const int *dp_h = dp_h_all + (size_t)b * cells;
+    abpoa_cigar_t *out_cigar = out_cigar_all + (size_t)b * (size_t)max_cigar;
+    int *out_n = out_n_cigar + b;
+    int *status = out_status + b;
+    (void)n_nodes;
+    int n_c = gpu_traceback_cpu_style_i32(
+            qlen, qcols, source_index, best_indices[b], query, bases, mat, m, node_ids,
+            pred_offsets, preds, gap_open1, gap_open2, gap_ext1, gap_ext2,
+            put_gap_on_right, put_gap_at_end, dp_e1, dp_e2, dp_f1, dp_f2, dp_h,
+            out_cigar, max_cigar);
+    *out_n = n_c > 0 ? n_c : 0;
+    *status = n_c > 0 ? 0 : -1;
+}
+
+static int cigar_node_id(abpoa_cigar_t c) {
+    return (int)(c >> 34);
+}
+
+static void trim_skippable_leading_deletions(abpoa_graph_t *graph, int *n_cigar, abpoa_cigar_t *cigar) {
+    while (*n_cigar > 1 && (int)(cigar[0] & 0xf) == ABPOA_CDEL) {
+        int next_i = 1, next_node = -1;
+        while (next_i < *n_cigar) {
+            int op = (int)(cigar[next_i] & 0xf);
+            if (op == ABPOA_CMATCH || op == ABPOA_CDIFF || op == ABPOA_CDEL) {
+                next_node = cigar_node_id(cigar[next_i]);
+                break;
+            }
+            ++next_i;
+        }
+        if (next_node < 0) break;
+        /* Match the SIMD path's convention: do not report graph-prefix deletions
+         * that happen before the first query-consuming operation. */
+        (void)graph;
+        memmove(cigar, cigar + 1, (size_t)(*n_cigar - 1) * sizeof(abpoa_cigar_t));
+        --(*n_cigar);
+    }
+}
+
+typedef struct {
+    abpoa_graph_t *graph;
+    uint64_t graph_sig, mat_sig;
+    int n_nodes, total_preds, source_index, sink_index, mat_m;
+    int node_cap, pred_cap;
+
+    int *node_ids, *pred_offsets, *preds;
+    uint8_t *bases;
+
+    uint8_t *d_query, *d_bases;
+    int *d_node_ids;
+    int *d_mat, *d_pred_offsets, *d_preds, *d_qlens;
+    int *d_m, *d_e1, *d_e2, *d_f1, *d_f2, *d_h;
+    int *d_best_score, *d_best_index;
+
+    abpoa_cigar_t *d_trace_cigar;
+    int *d_trace_n, *d_trace_status;
+
+    size_t d_query_bytes, d_bases_bytes, d_node_ids_bytes, d_mat_bytes, d_pred_offsets_bytes, d_preds_bytes, d_qlens_bytes;
+    size_t d_m_bytes, d_e1_bytes, d_e2_bytes, d_f1_bytes, d_f2_bytes, d_h_bytes;
+    size_t d_best_score_bytes, d_best_index_bytes, d_trace_cigar_bytes, d_trace_n_bytes, d_trace_status_bytes;
+} abpoa_gpu_context_t;
+
+static uint64_t fnv1a_update_bytes(uint64_t h, const void *data, size_t n) {
+    const uint8_t *p = (const uint8_t*)data;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t fnv1a_update_i32(uint64_t h, int v) {
+    return fnv1a_update_bytes(h, &v, sizeof(v));
+}
+
+static uint64_t gpu_graph_signature(abpoa_graph_t *graph) {
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv1a_update_i32(h, graph->node_n);
+    for (int idx = 0; idx < graph->node_n; ++idx) {
+        int node_id = graph->index_to_node_id[idx];
+        abpoa_node_t *node = &graph->node[node_id];
+        h = fnv1a_update_i32(h, idx);
+        h = fnv1a_update_i32(h, node_id);
+        h = fnv1a_update_bytes(h, &node->base, sizeof(node->base));
+        h = fnv1a_update_i32(h, node->in_edge_n);
+        for (int k = 0; k < node->in_edge_n; ++k) h = fnv1a_update_i32(h, node->in_id[k]);
+    }
+    return h;
+}
+
+static uint64_t gpu_mat_signature(abpoa_para_t *abpt) {
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv1a_update_i32(h, abpt->m);
+    return fnv1a_update_bytes(h, abpt->mat, (size_t)abpt->m * (size_t)abpt->m * sizeof(int));
+}
+
+static int ensure_cuda_alloc(void **ptr, size_t *cap_bytes, size_t need_bytes) {
+    if (need_bytes == 0) need_bytes = 1;
+    if (*ptr != NULL && *cap_bytes >= need_bytes) return 0;
+    if (*ptr != NULL) cudaFree(*ptr);
+    *ptr = NULL;
+    *cap_bytes = 0;
+    cudaError_t err = cudaMalloc(ptr, need_bytes);
+    if (err != cudaSuccess) {
+        gpu_set_cuda_error("cudaMalloc failed", err);
+        return -1;
+    }
+    *cap_bytes = need_bytes;
+    return 0;
+}
+
+static int gpu_round_thread_count(int threads) {
+    if (threads < 32) threads = 32;
+    if (threads > 512) threads = 512;
+    if (threads & (threads - 1)) {
+        if (threads < 64) threads = 32;
+        else if (threads < 128) threads = 64;
+        else if (threads < 256) threads = 128;
+        else if (threads < 512) threads = 256;
+        else threads = 512;
+    }
+    return threads;
+}
+
+static int gpu_thread_count(int n_nodes, int qlen, int band) {
+    char *env = getenv("ABPOA_GPU_THREADS");
+    if (env != NULL && env[0] != '\0') return gpu_round_thread_count(atoi(env));
+
+    int active_width = n_nodes < qlen ? n_nodes : qlen;
+    if (band > 0) {
+        int band_width = band * 2 + 1;
+        if (band_width < active_width) active_width = band_width;
+    }
+
+    int threads = 32;
+    while (threads < active_width && threads < 512) threads <<= 1;
+    return gpu_round_thread_count(threads);
+}
+
+static int gpu_band_width(int n_nodes, int qlen) {
+    (void)n_nodes;
+    (void)qlen;
+    char *env = getenv("ABPOA_GPU_BAND");
+    int band = env ? atoi(env) : 0;
+    if (band < 0) band = 0;
+    return band;
+}
+
+static int gpu_device_available(void) {
+    int device_n = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_n);
+    if (err != cudaSuccess) {
+        gpu_set_cuda_error("cudaGetDeviceCount failed", err);
+        return 0;
+    }
+    if (device_n <= 0) {
+        gpu_set_error("no CUDA device");
+        return 0;
+    }
+    return 1;
+}
+
+static int ensure_graph_host(abpoa_gpu_context_t *ctx, int n_nodes, int total_preds) {
+    int pred_cap = MAX_OF_TWO(total_preds, 1);
+    if (ctx->node_cap < n_nodes) {
+        ctx->node_cap = n_nodes;
+        ctx->node_ids = (int*)_err_realloc(ctx->node_ids, (size_t)n_nodes * sizeof(int));
+        ctx->bases = (uint8_t*)_err_realloc(ctx->bases, (size_t)n_nodes * sizeof(uint8_t));
+        ctx->pred_offsets = (int*)_err_realloc(ctx->pred_offsets, ((size_t)n_nodes + 1) * sizeof(int));
+    }
+    if (ctx->pred_cap < pred_cap) {
+        ctx->pred_cap = pred_cap;
+        ctx->preds = (int*)_err_realloc(ctx->preds, (size_t)pred_cap * sizeof(int));
+    }
+    return 0;
+}
+
+static int ensure_dp_buffers(abpoa_gpu_context_t *ctx, size_t cells, size_t dp_bytes, int qlen) {
+    (void)cells;
+    if (ensure_cuda_alloc((void**)&ctx->d_query, &ctx->d_query_bytes, (size_t)qlen * sizeof(uint8_t)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_m, &ctx->d_m_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_e1, &ctx->d_e1_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_e2, &ctx->d_e2_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_f1, &ctx->d_f1_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_f2, &ctx->d_f2_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_h, &ctx->d_h_bytes, dp_bytes) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void free_cuda_ptr(void *ptr) {
+    if (ptr != NULL) cudaFree(ptr);
+}
+
+extern "C" void abpoa_gpu_free_context(void *gpu_ctx) {
+    abpoa_gpu_context_t *ctx = (abpoa_gpu_context_t*)gpu_ctx;
+    if (ctx == NULL) return;
+
+    free(ctx->node_ids);
+    free(ctx->pred_offsets);
+    free(ctx->preds);
+    free(ctx->bases);
+
+    free_cuda_ptr(ctx->d_query);
+    free_cuda_ptr(ctx->d_bases);
+    free_cuda_ptr(ctx->d_node_ids);
+    free_cuda_ptr(ctx->d_mat);
+    free_cuda_ptr(ctx->d_pred_offsets);
+    free_cuda_ptr(ctx->d_preds);
+    free_cuda_ptr(ctx->d_qlens);
+    free_cuda_ptr(ctx->d_m);
+    free_cuda_ptr(ctx->d_e1);
+    free_cuda_ptr(ctx->d_e2);
+    free_cuda_ptr(ctx->d_f1);
+    free_cuda_ptr(ctx->d_f2);
+    free_cuda_ptr(ctx->d_h);
+    free_cuda_ptr(ctx->d_best_score);
+    free_cuda_ptr(ctx->d_best_index);
+    free_cuda_ptr(ctx->d_trace_cigar);
+    free_cuda_ptr(ctx->d_trace_n);
+    free_cuda_ptr(ctx->d_trace_status);
+
+    free(ctx);
+}
+
+static abpoa_gpu_context_t *get_gpu_context(abpoa_t *ab) {
+    if (ab->gpu_ctx == NULL) ab->gpu_ctx = _err_calloc(1, sizeof(abpoa_gpu_context_t));
+    return (abpoa_gpu_context_t*)ab->gpu_ctx;
+}
+
+static int upload_graph_if_needed(abpoa_gpu_context_t *ctx, abpoa_graph_t *graph, abpoa_para_t *abpt) {
+    uint64_t graph_sig = gpu_graph_signature(graph);
+    if (ctx->graph == graph && ctx->graph_sig == graph_sig) return 0;
+
+    int n_nodes = graph->node_n;
+    int total_preds = 0;
+    for (int idx = 0; idx < n_nodes; ++idx) {
+        int node_id = graph->index_to_node_id[idx];
+        total_preds += graph->node[node_id].in_edge_n;
+    }
+    ensure_graph_host(ctx, n_nodes, total_preds);
+
+    ctx->pred_offsets[0] = 0;
+    total_preds = 0;
+    for (int idx = 0; idx < n_nodes; ++idx) {
+        int node_id = graph->index_to_node_id[idx];
+        ctx->node_ids[idx] = node_id;
+        ctx->bases[idx] = graph->node[node_id].base;
+        total_preds += graph->node[node_id].in_edge_n;
+        ctx->pred_offsets[idx + 1] = total_preds;
+    }
+    if (total_preds == 0) ctx->preds[0] = 0;
+    for (int idx = 0; idx < n_nodes; ++idx) {
+        int node_id = ctx->node_ids[idx];
+        int out = ctx->pred_offsets[idx];
+        for (int k = 0; k < graph->node[node_id].in_edge_n; ++k) {
+            ctx->preds[out + k] = graph->node_id_to_index[graph->node[node_id].in_id[k]];
+        }
+    }
+
+    int pred_cap = MAX_OF_TWO(total_preds, 1);
+    if (ensure_cuda_alloc((void**)&ctx->d_bases, &ctx->d_bases_bytes, (size_t)n_nodes * sizeof(uint8_t)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_node_ids, &ctx->d_node_ids_bytes, (size_t)n_nodes * sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_pred_offsets, &ctx->d_pred_offsets_bytes, ((size_t)n_nodes + 1) * sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_preds, &ctx->d_preds_bytes, (size_t)pred_cap * sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_best_score, &ctx->d_best_score_bytes, sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_best_index, &ctx->d_best_index_bytes, sizeof(int)) != 0) {
+        gpu_set_error("failed to allocate/upload graph buffers");
+        return -1;
+    }
+    if (cudaMemcpy(ctx->d_bases, ctx->bases, (size_t)n_nodes * sizeof(uint8_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ctx->d_node_ids, ctx->node_ids, (size_t)n_nodes * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ctx->d_pred_offsets, ctx->pred_offsets, ((size_t)n_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ctx->d_preds, ctx->preds, (size_t)pred_cap * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_set_error("failed to upload graph to CUDA device");
+        return -1;
+    }
+
+    ctx->graph = graph;
+    ctx->graph_sig = graph_sig;
+    ctx->n_nodes = n_nodes;
+    ctx->total_preds = total_preds;
+    ctx->source_index = graph->node_id_to_index[ABPOA_SRC_NODE_ID];
+    ctx->sink_index = graph->node_id_to_index[ABPOA_SINK_NODE_ID];
+
+    if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+        fprintf(stderr, "[abpoa_gpu] uploaded graph n_nodes=%d total_preds=%d source_index=%d sink_index=%d\n",
+                ctx->n_nodes, ctx->total_preds, ctx->source_index, ctx->sink_index);
+    }
+    return 0;
+}
+
+static int upload_mat_if_needed(abpoa_gpu_context_t *ctx, abpoa_para_t *abpt) {
+    uint64_t mat_sig = gpu_mat_signature(abpt);
+    if (ctx->mat_m == abpt->m && ctx->mat_sig == mat_sig) return 0;
+    size_t mat_bytes = (size_t)abpt->m * (size_t)abpt->m * sizeof(int);
+    if (mat_bytes > ABPOA_GPU_MAX_MAT * sizeof(int)) {
+        gpu_set_error("score matrix too large for constant memory");
+        return -1;
+    }
+    if (ensure_cuda_alloc((void**)&ctx->d_mat, &ctx->d_mat_bytes, mat_bytes) != 0) return -1;
+    if (cudaMemcpy(ctx->d_mat, abpt->mat, mat_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_set_error("failed to upload score matrix to CUDA device");
+        return -1;
+    }
+    if (cudaMemcpyToSymbol(d_mat_const, abpt->mat, mat_bytes) != cudaSuccess) {
+        gpu_set_error("failed to upload score matrix to constant memory");
+        return -1;
+    }
+    ctx->mat_m = abpt->m;
+    ctx->mat_sig = mat_sig;
+    return 0;
+}
+
+extern "C" int abpoa_gpu_align_sequence_to_graph(abpoa_t *ab, abpoa_para_t *abpt, uint8_t *query, int qlen, abpoa_res_t *res) {
+    if (abpt->align_mode != ABPOA_GLOBAL_MODE || abpt->inc_path_score || qlen <= 0) return -1;
+
+    if (!gpu_device_available()) return -1;
+
+    abpoa_graph_t *graph = ab->abg;
+    abpoa_gpu_context_t *ctx = get_gpu_context(ab);
+    if (upload_graph_if_needed(ctx, graph, abpt) != 0 || upload_mat_if_needed(ctx, abpt) != 0) return -1;
+
+    int n_nodes = ctx->n_nodes, qcols = qlen + 1;
+    int source_index = ctx->source_index, sink_index = ctx->sink_index;
+    size_t cells = (size_t)n_nodes * (size_t)qcols;
+    if (cells == 0 || source_index < 0 || sink_index < 0) {
+        gpu_set_error("invalid single-query GPU dimensions");
+        return -1;
+    }
+
+    size_t dp_bytes = cells * sizeof(int);
+    if (ensure_dp_buffers(ctx, cells, dp_bytes, qlen) != 0) return -1;
+    if (cudaMemcpy(ctx->d_query, query, (size_t)qlen * sizeof(uint8_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_set_error("failed to upload query to CUDA device");
+        return -1;
+    }
+
+    int band = gpu_band_width(n_nodes, qlen);
+    int threads = gpu_thread_count(n_nodes, qlen, band);
+    abpoa_gpu_dp_kernel<<<1, threads, 3 * threads * sizeof(int)>>>(
+            n_nodes, qlen, qcols, source_index, sink_index,
+            ctx->d_query, ctx->d_bases, ctx->d_mat, abpt->m, ctx->d_pred_offsets, ctx->d_preds,
+            abpt->gap_open1, abpt->gap_open2, abpt->gap_ext1, abpt->gap_ext2,
+            ctx->d_m, ctx->d_e1, ctx->d_e2, ctx->d_f1, ctx->d_f2, ctx->d_h,
+            ctx->d_best_score, ctx->d_best_index);
+    cudaError_t launch_err = cudaGetLastError();
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+        if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+            fprintf(stderr, "[abpoa_gpu] kernel failed: launch=%s sync=%s\n",
+                    cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
+        }
+        gpu_set_cuda_error("single-query kernel failed", sync_err != cudaSuccess ? sync_err : launch_err);
+        return -1;
+    }
+
+    int best_score = GPU_INF_NEG, best_index = source_index;
+    if (cudaMemcpy(&best_score, ctx->d_best_score, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(&best_index, ctx->d_best_index, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        best_score <= GPU_INF_NEG / 2) {
+        gpu_set_error("failed to copy single-query best score from CUDA device");
+        return -1;
+    }
+
+    int max_cigar = n_nodes + qlen + 5;
+    if (ensure_cuda_alloc((void**)&ctx->d_trace_cigar, &ctx->d_trace_cigar_bytes, (size_t)max_cigar * sizeof(abpoa_cigar_t)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_trace_n, &ctx->d_trace_n_bytes, sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_trace_status, &ctx->d_trace_status_bytes, sizeof(int)) != 0) {
+        gpu_set_error("failed to allocate single-query traceback buffers");
+        return -1;
+    }
+
+    abpoa_gpu_traceback_kernel<<<1, 1>>>(
+            qlen, qcols, source_index, best_index,
+            ctx->d_query, ctx->d_bases, ctx->d_mat, abpt->m,
+            ctx->d_node_ids, ctx->d_pred_offsets, ctx->d_preds,
+            abpt->gap_open1, abpt->gap_open2, abpt->gap_ext1, abpt->gap_ext2,
+            abpt->put_gap_on_right, abpt->put_gap_at_end,
+            ctx->d_e1, ctx->d_e2, ctx->d_f1, ctx->d_f2, ctx->d_h,
+            ctx->d_trace_cigar, max_cigar, ctx->d_trace_n, ctx->d_trace_status);
+    launch_err = cudaGetLastError();
+    sync_err = cudaDeviceSynchronize();
+    if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+        if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+            fprintf(stderr, "[abpoa_gpu] traceback kernel failed: launch=%s sync=%s\n",
+                    cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
+        }
+        gpu_set_cuda_error("single-query traceback kernel failed", sync_err != cudaSuccess ? sync_err : launch_err);
+        return -1;
+    }
+
+    int trace_n = 0, trace_status = -1;
+    int copy_ok = cudaMemcpy(&trace_n, ctx->d_trace_n, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess &&
+                  cudaMemcpy(&trace_status, ctx->d_trace_status, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
+
+    int ret = -1;
+    if (copy_ok && trace_status == 0 && trace_n > 0 && best_score > GPU_INF_NEG / 2) {
+        if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+            fprintf(stderr, "[abpoa_gpu] best_score=%d best_index=%d best_node=%d\n",
+                    best_score, best_index, ctx->node_ids[best_index]);
+        }
+        res->best_score = best_score;
+        res->graph_cigar = (abpoa_cigar_t*)_err_malloc((size_t)trace_n * sizeof(abpoa_cigar_t));
+        if (cudaMemcpy(res->graph_cigar, ctx->d_trace_cigar, (size_t)trace_n * sizeof(abpoa_cigar_t), cudaMemcpyDeviceToHost) == cudaSuccess) {
+            if (!abpt->rev_cigar) {
+                abpoa_reverse_cigar(trace_n, res->graph_cigar);
+                trim_skippable_leading_deletions(graph, &trace_n, res->graph_cigar);
+            }
+            res->n_cigar = trace_n;
+            res->m_cigar = trace_n;
+            res->node_s = ctx->node_ids[source_index];
+            res->node_e = ctx->node_ids[best_index];
+            res->query_s = 0;
+            res->query_e = qlen - 1;
+            ret = 0;
+        } else {
+            free(res->graph_cigar);
+            res->graph_cigar = NULL;
+            res->n_cigar = res->m_cigar = 0;
+            gpu_set_error("failed to copy single-query traceback from CUDA device");
+        }
+    }
+    if (ret != 0) gpu_set_error("single-query GPU traceback produced no valid alignment");
+    return ret;
+}
+
+extern "C" int abpoa_gpu_align_sequences_to_graph(abpoa_t *ab, abpoa_para_t *abpt, uint8_t **queries, int *qlens, int n_queries, abpoa_res_t *results) {
+    if (n_queries <= 0) return 0;
+    if (abpt->align_mode != ABPOA_GLOBAL_MODE || abpt->inc_path_score) return -1;
+    int max_qlen = qlens[0];
+    for (int i = 0; i < n_queries; ++i) {
+        if (qlens[i] <= 0) return -1;
+        if (qlens[i] != max_qlen) {
+            gpu_set_error("GPU batch requires equal-length queries");
+            return -1;
+        }
+    }
+
+    if (!gpu_device_available()) return -1;
+
+    abpoa_graph_t *graph = ab->abg;
+    abpoa_gpu_context_t *ctx = get_gpu_context(ab);
+    if (upload_graph_if_needed(ctx, graph, abpt) != 0 || upload_mat_if_needed(ctx, abpt) != 0) return -1;
+
+    int n_nodes = ctx->n_nodes, qcols = max_qlen + 1;
+    int source_index = ctx->source_index, sink_index = ctx->sink_index;
+    size_t cells = (size_t)n_nodes * (size_t)qcols;
+    if (cells == 0 || source_index < 0 || sink_index < 0) {
+        gpu_set_error("invalid batch GPU dimensions");
+        return -1;
+    }
+
+    size_t batch_cells = cells * (size_t)n_queries;
+    int band = gpu_band_width(n_nodes, max_qlen);
+    size_t dp_bytes = batch_cells * sizeof(int);
+    size_t query_bytes = (size_t)n_queries * (size_t)max_qlen * sizeof(uint8_t);
+    int max_cigar = n_nodes + max_qlen + 5;
+    size_t trace_bytes = (size_t)n_queries * (size_t)max_cigar * sizeof(abpoa_cigar_t);
+
+    if (ensure_cuda_alloc((void**)&ctx->d_query, &ctx->d_query_bytes, query_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_qlens, &ctx->d_qlens_bytes, (size_t)n_queries * sizeof(int)) != 0) {
+        return -1;
+    }
+    if (ensure_cuda_alloc((void**)&ctx->d_m, &ctx->d_m_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_e1, &ctx->d_e1_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_e2, &ctx->d_e2_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_f1, &ctx->d_f1_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_f2, &ctx->d_f2_bytes, dp_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_h, &ctx->d_h_bytes, dp_bytes) != 0) {
+        return -1;
+    }
+    if (ensure_cuda_alloc((void**)&ctx->d_best_score, &ctx->d_best_score_bytes, (size_t)n_queries * sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_best_index, &ctx->d_best_index_bytes, (size_t)n_queries * sizeof(int)) != 0) {
+        return -1;
+    }
+    if (ensure_cuda_alloc((void**)&ctx->d_trace_cigar, &ctx->d_trace_cigar_bytes, trace_bytes) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_trace_n, &ctx->d_trace_n_bytes, (size_t)n_queries * sizeof(int)) != 0 ||
+        ensure_cuda_alloc((void**)&ctx->d_trace_status, &ctx->d_trace_status_bytes, (size_t)n_queries * sizeof(int)) != 0) {
+        return -1;
+    }
+
+    uint8_t *h_queries = (uint8_t*)_err_calloc(query_bytes, sizeof(uint8_t));
+    for (int i = 0; i < n_queries; ++i) {
+        memcpy(h_queries + (size_t)i * (size_t)max_qlen, queries[i], (size_t)qlens[i] * sizeof(uint8_t));
+    }
+    int ret = -1;
+    int threads = gpu_thread_count(n_nodes, max_qlen, band);
+    int *h_best_scores = NULL, *h_best_indices = NULL, *h_trace_n = NULL, *h_trace_status = NULL;
+    abpoa_cigar_t *h_trace = NULL;
+
+    if (cudaMemcpy(ctx->d_query, h_queries, query_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ctx->d_qlens, qlens, (size_t)n_queries * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) {
+        gpu_set_error("failed to upload query batch to CUDA device");
+        goto End;
+    }
+
+    abpoa_gpu_dp_batch_kernel<<<n_queries, threads, 3 * threads * sizeof(int)>>>(
+            n_queries, n_nodes, max_qlen, qcols, source_index, sink_index,
+            ctx->d_query, ctx->d_qlens, ctx->d_bases, ctx->d_mat, abpt->m, ctx->d_pred_offsets, ctx->d_preds,
+            abpt->gap_open1, abpt->gap_open2, abpt->gap_ext1, abpt->gap_ext2,
+            band,
+            ctx->d_m, ctx->d_e1, ctx->d_e2, ctx->d_f1, ctx->d_f2, ctx->d_h,
+            ctx->d_best_score, ctx->d_best_index);
+    {
+        cudaError_t launch_err = cudaGetLastError();
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+            if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+                fprintf(stderr, "[abpoa_gpu] batch kernel failed: launch=%s sync=%s\n",
+                        cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
+            }
+            gpu_set_cuda_error("batch kernel failed", sync_err != cudaSuccess ? sync_err : launch_err);
+            goto End;
+        }
+    }
+
+    abpoa_gpu_traceback_batch_kernel<<<n_queries, 1>>>(
+            n_queries, n_nodes, max_qlen, qcols, source_index, ctx->d_best_index,
+            ctx->d_qlens, ctx->d_query, ctx->d_bases, ctx->d_mat, abpt->m,
+            ctx->d_node_ids, ctx->d_pred_offsets, ctx->d_preds,
+            abpt->gap_open1, abpt->gap_open2, abpt->gap_ext1, abpt->gap_ext2,
+            abpt->put_gap_on_right, abpt->put_gap_at_end,
+            ctx->d_e1, ctx->d_e2, ctx->d_f1, ctx->d_f2, ctx->d_h,
+            ctx->d_trace_cigar, max_cigar, ctx->d_trace_n, ctx->d_trace_status);
+    {
+        cudaError_t launch_err = cudaGetLastError();
+        cudaError_t sync_err = cudaDeviceSynchronize();
+        if (launch_err != cudaSuccess || sync_err != cudaSuccess) {
+            if (abpt->verbose >= ABPOA_INFO_VERBOSE) {
+                fprintf(stderr, "[abpoa_gpu] batch traceback kernel failed: launch=%s sync=%s\n",
+                        cudaGetErrorString(launch_err), cudaGetErrorString(sync_err));
+            }
+            gpu_set_cuda_error("batch traceback kernel failed", sync_err != cudaSuccess ? sync_err : launch_err);
+            goto End;
+        }
+    }
+
+    h_best_scores = (int*)_err_malloc((size_t)n_queries * sizeof(int));
+    h_best_indices = (int*)_err_malloc((size_t)n_queries * sizeof(int));
+    h_trace_n = (int*)_err_malloc((size_t)n_queries * sizeof(int));
+    h_trace_status = (int*)_err_malloc((size_t)n_queries * sizeof(int));
+    h_trace = (abpoa_cigar_t*)_err_malloc(trace_bytes);
+    if (cudaMemcpy(h_best_scores, ctx->d_best_score, (size_t)n_queries * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h_best_indices, ctx->d_best_index, (size_t)n_queries * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h_trace_n, ctx->d_trace_n, (size_t)n_queries * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h_trace_status, ctx->d_trace_status, (size_t)n_queries * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h_trace, ctx->d_trace_cigar, trace_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        gpu_set_error("failed to copy batch traceback results from CUDA device");
+        goto End;
+    }
+
+    for (int i = 0; i < n_queries; ++i) {
+        results[i].n_cigar = results[i].m_cigar = 0;
+        results[i].graph_cigar = NULL;
+        if (h_trace_status[i] != 0 || h_trace_n[i] <= 0 || h_best_scores[i] <= GPU_INF_NEG / 2) {
+            gpu_set_error("batch GPU traceback produced invalid alignment");
+            goto End;
+        }
+        results[i].best_score = h_best_scores[i];
+        results[i].graph_cigar = (abpoa_cigar_t*)_err_malloc((size_t)h_trace_n[i] * sizeof(abpoa_cigar_t));
+        memcpy(results[i].graph_cigar, h_trace + (size_t)i * (size_t)max_cigar, (size_t)h_trace_n[i] * sizeof(abpoa_cigar_t));
+        if (!abpt->rev_cigar) {
+            abpoa_reverse_cigar(h_trace_n[i], results[i].graph_cigar);
+            trim_skippable_leading_deletions(graph, &h_trace_n[i], results[i].graph_cigar);
+        }
+        results[i].n_cigar = h_trace_n[i];
+        results[i].m_cigar = h_trace_n[i];
+        results[i].node_s = ctx->node_ids[source_index];
+        results[i].node_e = ctx->node_ids[h_best_indices[i]];
+        results[i].query_s = 0;
+        results[i].query_e = qlens[i] - 1;
+    }
+    ret = 0;
+
+End:
+    if (ret != 0) {
+        for (int i = 0; i < n_queries; ++i) {
+            if (results[i].graph_cigar) {
+                free(results[i].graph_cigar);
+                results[i].graph_cigar = NULL;
+            }
+            results[i].n_cigar = results[i].m_cigar = 0;
+        }
+    }
+    free(h_queries);
+    if (h_best_scores) free(h_best_scores);
+    if (h_best_indices) free(h_best_indices);
+    if (h_trace_n) free(h_trace_n);
+    if (h_trace_status) free(h_trace_status);
+    if (h_trace) free(h_trace);
+    return ret;
+}
