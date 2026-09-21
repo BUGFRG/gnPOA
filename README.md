@@ -1,74 +1,109 @@
-fgpoa-gpu
-fgpoa-gpu extends fgpoa with a CUDA backend for GPU-accelerated sequence-to-graph alignment. It performs the full DP scoring and traceback on GPU, supports batched processing of equal-length reads, and uses banded DP to reduce unnecessary computation — achieving ~14.8× speedup over the CPU path on 1M × 1000 bp reads (RTX 3090) with identical best_score results.
+# fgpoa (Folded Graph Partial Order Alignment)
 
-Download and Compile
-sh
+<p align="center">
+  <img src="https://img.shields.io/badge/Language-C-blue.svg" alt="Language">
+  <img src="https://img.shields.io/badge/Build-Passing-brightgreen.svg" alt="Build">
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg" alt="Platform">
+</p>
 
+---
+
+**fgpoa** is designed to leverage a **folded genome graph structure** to deliver a fast, memory-efficient, and highly accurate method for **sequence-to-graph alignment**. It enhances both the sequence-to-graph scoring algorithm and the optimal alignment backtracking algorithm.
+
+<p align="center">
+  <img src="docs/folded_graph_structure.png" alt="Folded Graph Structure" width="650"/>
+  <br>
+  <em>Figure: Folded genome graph structure overview.</em>
+</p>
+
+---
+
+## ✨ Key Features
+
+- ⚡ **High Efficiency**: Fast alignment speed optimized for sequence-to-graph matching.
+- 💾 **Low Memory Footprint**: Compact data structures tailored for folded DAG graphs.
+- 🎯 **Accurate Backtracking**: Improved scoring and optimal path traceback algorithms.
+
+---
+
+## 📦 Download & Compile
+
+### Prerequisites
+- GCC / Clang (with C99 support)
+- GNU Make
+- `zlib` development library
+
+### Build Steps
+
+```bash
+# 1. Clone the repository
 git clone https://github.com/zzzerd/fgpoa.git
-cd fgpoa && make gpu=1 NVCC=/path/to/nvcc
-By default the Makefile targets sm_86 (Ampere / RTX 3090). Override with NVCC_ARCH=-arch=sm_90 for Hopper, etc.
 
-Verify the binary is linked to CUDA:
+# 2. Enter directory and compile
+cd fgpoa && make
+```
 
-sh
+---
 
-ldd bin/abpoa | grep cudart
-Usage
-Help page
+## 🚀 Usage
 
-sh
+### 1. View Help
 
-bin/abpoa -h
-CPU alignment (baseline):
+```bash
+./fgpoa -h
+```
 
-sh
+### 2. Align Reads to a Reference Graph
 
-bin/abpoa -b -1 -i graph.gfa -o cpu.tsv reads.fa
-GPU alignment:
+Align query sequences (`reads.fq`) against a reference DAG graph in **GFA** format (`graph.gfa`):
 
-sh
+```bash
+./fgpoa -i graph.gfa -r 4 -b -1 -o outputfile.txt reads.fq
+```
 
-bin/abpoa -U -b -1 -i graph.gfa -o gpu.tsv reads.fa
-Flag / Arg	Description
--U / --gpu	Enable CUDA sequence-to-graph DP
--b -1	Disable CPU adaptive band (for fair CPU/GPU comparison)
--i graph.gfa	Input graph (GFA format)
--o output.tsv	Output file
-reads.fa	Input reads (FASTA/FASTQ)
-GPU Environment Variables
-sh
+#### Common Parameters
 
-ABPOA_GPU_BATCH=256       # reads per batch
-ABPOA_GPU_THREADS=128     # threads per CUDA block
-ABPOA_GPU_BAND=8          # band width (0 = full DP)
-ABPOA_GPU_SCORE_ONLY=1    # score only, skip traceback (CIGAR = *)
-ABPOA_GPU_I16=1           # use 16-bit DP when safe
-Recommended configuration (1000 bp reads / graph_81):
+| Option | Argument | Description |
+| :--- | :--- | :--- |
+| `-i` | `FILE` | Reference DAG graph in `.gfa` format |
+| `-r` | `INT` | Match / mismatch scoring parameters |
+| `-b` | `INT` | Bandwidth / gap penalty parameter |
+| `-o` | `FILE` | Output file path |
+| `[reads]` | `FILE` | Query sequence file (`.fa`, `.fq`, `.fastq`, etc.) |
 
-sh
+> [!NOTE]
+> Currently, only **sequence-to-graph alignment** is supported. Sequence graph generation from scratch is not yet implemented.
 
-ABPOA_GPU_BAND=8 ABPOA_GPU_BATCH=256 ABPOA_GPU_THREADS=128 \
-  bin/abpoa -U -b -1 -i graph.gfa -o gpu.tsv reads.fa
-Output Format
-The output is tab-delimited. Each line consists of the read name, maximum score, matching path, and CIGAR string. The path is represented as a tuple of segments and base offsets.
+---
 
-Benchmark
-Run the built-in benchmark script:
+## 📄 Output Format
 
-sh
+The output is **tab-delimited (TSV)**, where each line represents an aligned query read with the following fields:
 
-scripts/benchmark_large_dataset.sh 1000     # quick 1k-read test
-scripts/benchmark_large_dataset.sh full      # full 1M-read experiment
-1M × 1000 bp Results (RTX 3090)
-Wall Time	Speedup
-CPU	21 min 19 s	—
-GPU	1 min 26 s	14.8×
-score_mismatches: 0 (GPU scores identical to CPU)
-avg_gpu_utilization: 90.3 %
-Peak GPU memory: 6285 MB
-Current Limitations
-Batch path requires equal-length reads within each batch.
-One CUDA block per query; very long single reads cannot span multiple SMs.
-local / extension modes fall back to CPU.
-License
-See fgpoa for license details.
+| Column | Field Name | Description |
+| :---: | :--- | :--- |
+| **1** | `Max Score` | Optimal alignment score |
+| **2** | `Path Matching` | Path representation as tuples of segment IDs and base offsets: `(segment, offset)` |
+| **3** | `CIGAR` | Standard alignment CIGAR string across the matched path |
+
+### Example Output
+
+```text
+142    (seg1:0, seg2:15, seg5:0)    150M2D10M
+```
+
+---
+
+## 📜 Citation & License
+
+This project is open-source under the [MIT License](LICENSE).  
+If you use **fgpoa** in your research, please cite:
+
+```bibtex
+@article{fgpoa,
+  title={fgpoa: Fast and memory-efficient sequence-to-graph alignment with folded graph partial order alignment},
+  author={zzzerd},
+  year={2024}
+}
+```
