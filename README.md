@@ -48,31 +48,47 @@ make gpu=1 NVCC_ARCH=-arch=sm_86
 
 # 3. Verify CUDA runtime linkage
 ldd bin/abpoa | grep cudart
+```
+
+---
 
 ## 🚀 Usage
+
 ### 1. Produce Help Page
+
 ```bash
 ./bin/abpoa -h
 ```
+
 ---
+
 ### 2. Basic Alignment (CPU Mode)
+
 Align a set of query sequences against a reference DAG (in `.gfa` format):
+
 ```bash
 ./bin/abpoa -i graph.gfa -r 4 -b -1 -o output_cpu.txt reads.fq
 ```
+
 ---
+
 ### 3. GPU-Accelerated Alignment
+
 Add `-U` (or `--gpu`) to enable CUDA hardware acceleration:
+
 ```bash
 ./bin/abpoa -U -i graph.gfa -r 4 -b -1 -o output_gpu.txt reads.fq
 ```
+
 ---
+
 ### 4. High-Performance GPU Execution
+
 To optimize throughput on large read sets, specify runtime environment variables along with the command:
+
 ```bash
 ABPOA_GPU_BAND=8 \
 ABPOA_GPU_BATCH=256 \
 ABPOA_GPU_THREADS=128 \
 ./bin/abpoa -U -i graph.gfa -r 4 -b -1 -o output_gpu.txt reads.fq
 ```
----
